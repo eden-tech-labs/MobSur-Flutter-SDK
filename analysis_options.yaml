@@ -2,3 +2,8 @@ include: package:flutter_lints/flutter.yaml
 
 # Additional information about this file can be found at
 # https://dart.dev/guides/language/analysis-options
+
+# Newer Flutter versions add these on `flutter pub get` if they are missing.
+analyzer:
+  exclude:
+    - build/**
