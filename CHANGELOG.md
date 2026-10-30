@@ -1,3 +1,29 @@
+## 2.1.0
+
+* **In-app message experiments with a holdout.** The fetch response's new `experiments` list is
+  parsed (unusable entries are skipped). `logEvent` checks experiments before surveys with the same
+  occurrence counting (counters keyed by experiment ID), and experiments share the
+  one-overlay-per-session rule with surveys.
+  * `treatment`: after the rule's delay, shows a native bottom sheet (optional image, title, body,
+    call-to-action, dismiss) styled by your app's theme, and reports `exposed`.
+  * `control`: shows nothing, still reports `exposed`, and uses the session's overlay slot.
+  * Each experiment runs at most once per person on the device.
+* New `setAttributes(Map<String, Object?>)`: strings, numbers and booleans, merged into the
+  attributes kept on the device; `null` removes a key. They are sent with each fetch as the
+  `attributes` query parameter, and a change fetches again without resetting event counts.
+* New `setup` options:
+  * `onAction`: receives the call-to-action (for example `myapp://paywall`) after the sheet closes.
+    Without it, the action is opened with `url_launcher`.
+  * `canShowOverlay`: checked right before a survey or message would appear. Returning `false`
+    skips it without reporting anything or using the session's slot.
+* Experiment events (`exposed`, `cta_tapped`, `dismissed`) go to
+  `POST /api/experiments/{id}/events` through a persisted, in-order queue. Each event has a
+  client-generated `event_id`, so retries are idempotent. Failed sends are retried with backoff
+  (5 s doubling up to 1 h, and again at the next launch) until the server answers 2xx. Other 4xx
+  answers (except 408/429) drop the event.
+* New `availableExperiments()` for debugging. `Experiment` and `ExperimentMessage` are exported.
+* Adds a dependency on `url_launcher`.
+
 ## 2.0.0
 
 * Reads surveys from the current MobSur dashboard. 1.x failed to parse any survey whose rule had an

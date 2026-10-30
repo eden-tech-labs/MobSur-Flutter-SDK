@@ -1,14 +1,14 @@
 # MobSur Flutter SDK
 
-Show [MobSur](https://mobsur.com) surveys in your Flutter app at the moments you choose, for example
-right after someone reports a wrong result. You build and launch surveys in the MobSur dashboard;
-your app only reports events.
+Show [MobSur](https://mobsur.com) surveys and in-app message experiments in your Flutter app at the
+moments you choose, for example right after someone reports a wrong result. You build and launch
+surveys in the MobSur dashboard; your app only reports events.
 
 ## Install
 
 ```yaml
 dependencies:
-  mobsur_flutter_sdk: ^2.0.0
+  mobsur_flutter_sdk: ^2.1.0
 ```
 
 Requirements: Dart 3, Flutter 3.10 or newer, iOS and Android. Surveys are shown with
@@ -77,6 +77,69 @@ Also:
   occurrence count is still inside the range. Set **Through occurrence** to limit repeats.
 - The list of surveys is refreshed at launch, when the user ID changes, and every 6 hours after that.
 
+## In-app message experiments
+
+An experiment shows a short message (title, body, optional image, a call-to-action and a dismiss
+button) when an event happens, and keeps a holdout group that sees nothing, so you can measure
+whether the message works. The server assigns each person to `treatment` or `control`.
+
+- **treatment:** after the rule's delay, the message opens in a bottom sheet styled by your app's
+  theme.
+- **control:** nothing is shown, but the SDK still records that the message *would* have been shown.
+  This also uses up the session's slot, so both groups see the same number of other surveys and
+  messages.
+
+Experiments are checked before surveys, use the same occurrence rules, and share the one-per-session
+limit with surveys. Each experiment runs at most once per person.
+
+### Attributes
+
+The server picks which experiments a person is in from the attributes your app sets:
+
+```dart
+MobSurSDK().setAttributes({'is_subscribed': false});
+```
+
+Values can be strings, numbers or booleans. They are merged with the ones you set before and kept
+on the device. Pass `null` to remove one. When a value changes, the SDK fetches again; event counts
+are kept. Attributes set before `setup` finishes are applied by `setup`.
+
+### Handling the call-to-action
+
+```dart
+await MobSurSDK().setup(
+  'YOUR-APP-ID',
+  userId,
+  navigatorKey: navigatorKey,
+  onAction: (action) => router.open(action), // e.g. 'myapp://paywall?placement=welcome'
+);
+```
+
+`onAction` is called after the sheet closes. Without it, the SDK opens the action as a URL with
+[`url_launcher`](https://pub.dev/packages/url_launcher).
+
+### Keeping messages off your own screens
+
+Your app may show its own full-screen UI (a paywall, a purchase flow) during the rule's delay. Tell
+the SDK when it must not show anything:
+
+```dart
+await MobSurSDK().setup(
+  'YOUR-APP-ID',
+  userId,
+  canShowOverlay: () => !paywallIsOpen,
+);
+```
+
+It is checked right before a survey or message would appear. When it returns `false`, nothing
+appears or is reported, and a later event can try again. This applies to both experiment groups,
+so they stay comparable.
+
+### Reporting
+
+The SDK reports `exposed`, `cta_tapped` and `dismissed` to MobSur. Reports are saved on the device
+and retried until the server has them, so a flaky connection doesn't lose them.
+
 ## Debugging
 
 ```dart
@@ -85,15 +148,17 @@ await MobSurSDK().setup('YOUR-APP-ID', userId, debug: true);
 
 Debug mode prints what the SDK does to the console with a `MobSur ::` prefix: surveys received,
 events that did or didn't match, and why a survey wasn't shown. `MobSurSDK().availableSurveys()`
-returns the surveys currently on the device.
+and `MobSurSDK().availableExperiments()` return what is currently on the device.
 
 The SDK never throws into your app. Calls made before `setup` finishes are ignored.
 
 ## Privacy
 
 The SDK sends MobSur your App ID, the user ID, your app version, the platform, the device's preferred
-languages and the SDK version. On the device it stores the survey list, event counts for those
-surveys, finished survey IDs and the user ID in `SharedPreferences` under keys starting with `MobSur_`.
+languages, the SDK version and the attributes you set. For experiments it also sends which group the
+person is in and when they saw, tapped or dismissed the message. On the device it stores the survey
+and experiment lists, event counts for them, finished survey and experiment IDs, your attributes,
+unsent experiment reports and the user ID in `SharedPreferences` under keys starting with `MobSur_`.
 
 ## Upgrading from 1.x
 

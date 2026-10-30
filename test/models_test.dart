@@ -117,4 +117,86 @@ void main() {
     expect(restored.single.toJson(), original.single.toJson());
     expect(restored.single.endDate, DateTime.utc(2026, 10, 28, 10));
   });
+
+  group('experiments', () {
+    Map<String, Object?> experiment({Object? id = 'exp_01', Object? arm = 'treatment', Object? message = ''}) => {
+          'id': id,
+          'arm': arm,
+          'start_date': '2026-10-31T00:00:00+00:00',
+          'end_date': null,
+          'rules': [
+            {
+              'type': 'counted_event',
+              'name': 'Snap_Results_Viewed',
+              'occurred': {'min': 3, 'max': null},
+              'delay': 800
+            },
+          ],
+          'message': message == ''
+              ? {
+                  'title': 'Know every plant you meet',
+                  'body': 'Unlimited identifications and plant care plans with Premium.',
+                  'cta_label': 'Try Premium free',
+                  'cta_action': 'plantsnap://paywall?placement=mob_exp_01',
+                  'dismiss_label': 'Not now',
+                  'image_url': null,
+                }
+              : message,
+        };
+
+    String withExperiments(Object? experiments) => jsonEncode({'data': [], 'experiments': experiments});
+
+    test('parses the contract example for both arms', () {
+      final parsed = parseExperimentList(withExperiments([
+        experiment(),
+        experiment(id: 'exp_02', arm: 'control', message: null),
+      ]))!;
+
+      final treatment = parsed[0];
+      expect(treatment.id, 'exp_01');
+      expect(treatment.arm, Experiment.treatment);
+      expect(treatment.isControl, isFalse);
+      expect(treatment.startDate, DateTime.utc(2026, 10, 31));
+      expect(treatment.endDate, isNull);
+      expect(treatment.rules.single.name, 'Snap_Results_Viewed');
+      expect(treatment.rules.single.occurred!.min, 3);
+      expect(treatment.rules.single.delay, 800);
+      expect(treatment.message!.title, 'Know every plant you meet');
+      expect(treatment.message!.ctaAction, 'plantsnap://paywall?placement=mob_exp_01');
+      expect(treatment.message!.dismissLabel, 'Not now');
+      expect(treatment.message!.imageUrl, isNull);
+
+      expect(parsed[1].isControl, isTrue);
+      expect(parsed[1].message, isNull);
+    });
+
+    test('a missing or malformed experiments key means none, so old servers keep working', () {
+      expect(parseExperimentList('{"data":[]}'), isEmpty);
+      expect(parseExperimentList(withExperiments({'nope': 1})), isEmpty);
+      expect(parseExperimentList('<html>Wi-Fi login</html>'), isNull);
+      expect(parseExperimentList('{"experiments":[]}'), isNull);
+    });
+
+    test('skips unusable experiments without losing the others, in server order', () {
+      final parsed = parseExperimentList(withExperiments([
+        experiment(id: 'a'),
+        experiment(id: 7),
+        experiment(id: 'b', arm: 'holdout'),
+        experiment(id: 'c', message: null), // treatment needs a message
+        experiment(id: 'd', message: {'title': 'No call to action'}),
+        'nonsense',
+        experiment(id: 'e', arm: 'control', message: {'title': 'ignored'}),
+      ]))!;
+
+      expect(parsed.map((e) => e.id), ['a', 'e']);
+      expect(parsed[1].message, isNull);
+    });
+
+    test('round-trips through the cache format', () {
+      final original = parseExperimentList(withExperiments([experiment()]))!;
+      final restored = parseExperimentList(withExperiments(original.map((e) => e.toJson()).toList()))!;
+
+      expect(restored.single.toJson(), original.single.toJson());
+    });
+  });
 }
