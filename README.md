@@ -102,7 +102,8 @@ MobSurSDK().setAttributes({'is_subscribed': false});
 
 Values can be strings, numbers or booleans. They are merged with the ones you set before and kept
 on the device. Pass `null` to remove one. When a value changes, the SDK fetches again; event counts
-are kept. Attributes set before `setup` finishes are applied by `setup`.
+are kept. No experiment runs until that fetch succeeds, because the saved ones were chosen for the
+old values. Attributes set before `setup` finishes are applied by `setup`.
 
 ### Handling the call-to-action
 
@@ -138,7 +139,8 @@ so they stay comparable.
 ### Reporting
 
 The SDK reports `exposed`, `cta_tapped` and `dismissed` to MobSur. Reports are saved on the device
-and retried until the server has them, so a flaky connection doesn't lose them.
+and retried until the server has them, so a flaky connection doesn't lose them. A report the server
+keeps refusing for 7 days is dropped, so it can't block the ones behind it.
 
 ## Debugging
 

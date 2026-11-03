@@ -20,7 +20,8 @@
   `POST /api/experiments/{id}/events` through a persisted, in-order queue. Each event has a
   client-generated `event_id`, so retries are idempotent. Failed sends are retried with backoff
   (5 s doubling up to 1 h, and again at the next launch) until the server answers 2xx. Other 4xx
-  answers (except 408/429) drop the event.
+  answers (except 408/429) drop the event, and so does 7 days of the server refusing it. Time
+  offline doesn't count towards those 7 days.
 * New `availableExperiments()` for debugging. `Experiment` and `ExperimentMessage` are exported.
 * Adds a dependency on `url_launcher`.
 

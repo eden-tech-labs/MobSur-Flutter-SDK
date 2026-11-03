@@ -149,7 +149,8 @@ class MobSurSDK {
   /// Values are merged into the attributes set before and kept across
   /// launches; a `null` value removes that key. Values must be strings,
   /// numbers or booleans. When anything changes, experiments and surveys are
-  /// fetched again (event counts are kept).
+  /// fetched again (event counts are kept), and no experiment runs until that
+  /// fetch succeeds, because the ones saved were chosen for the old attributes.
   void setAttributes(Map<String, Object?> attributes) {
     try {
       final engine = _engine;
@@ -216,6 +217,10 @@ class MobSurSDK {
 
   void _presentExperiment(SurveyEngine engine, Experiment experiment, BuildContext? context) {
     try {
+      if (!engine.isLive(experiment)) {
+        engine.presentationAbandoned();
+        return _log('Experiment ${experiment.id} not run: the person or their attributes changed during the delay.');
+      }
       // Both arms need the UI the treatment would use, so they are exposed
       // under the same conditions.
       final target = context ?? _navigatorKey?.currentContext;
@@ -229,7 +234,10 @@ class MobSurSDK {
       }
       engine.presentationStarted();
       engine.markExperimentDone(experiment.id);
-      _report(experiment, 'exposed');
+      // Every event from this exposure belongs to this person, even if someone
+      // else signs in while the sheet is open.
+      final userId = engine.userId;
+      _report(experiment, 'exposed', userId);
       final message = experiment.message;
       if (experiment.isControl || message == null) {
         return _log('Experiment ${experiment.id}: control arm, nothing shown.');
@@ -238,12 +246,12 @@ class MobSurSDK {
       unawaited(showExperimentSheet(
         target,
         message,
-        onCtaTapped: () => _report(experiment, 'cta_tapped'),
+        onCtaTapped: () => _report(experiment, 'cta_tapped', userId),
       ).then((tapped) {
         if (tapped) {
           _runAction(message.ctaAction);
         } else {
-          _report(experiment, 'dismissed');
+          _report(experiment, 'dismissed', userId);
         }
       }).catchError((Object error) {
         _log('Experiment ${experiment.id} message failed: $error');
@@ -265,15 +273,14 @@ class MobSurSDK {
     }
   }
 
-  void _report(Experiment experiment, String kind) {
-    final engine = _engine;
+  void _report(Experiment experiment, String kind, String? userId) {
     final queue = _queue;
     final appId = _appId;
-    if (engine == null || queue == null || appId == null) return;
+    if (userId == null || queue == null || appId == null) return;
     queue.add(experiment.id, {
       'event_id': generateUserId(),
       'app_id': appId,
-      'user_reference_id': engine.userId,
+      'user_reference_id': userId,
       'kind': kind,
       'arm': experiment.arm,
       'occurred_at': _timestamp(DateTime.now()),

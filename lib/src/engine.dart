@@ -58,6 +58,8 @@ class SurveyEngine {
   final Map<String, Map<String, int>> _experimentCounters = {};
   final Map<String, Object> _attributes = {};
   _Session _session = _Session.idle;
+  // The count behind the pending presentation, given back if it is abandoned.
+  ({Map<String, int> events, String name})? _pendingCount;
 
   List<Survey> get surveys => List.unmodifiable(_surveys);
 
@@ -73,6 +75,10 @@ class SurveyEngine {
 
   /// Merges [changes] into the saved attributes; `null` removes a key. Values of
   /// other types are ignored and their keys returned in `rejected`.
+  ///
+  /// The cached experiments were chosen for the old attributes (someone who just
+  /// subscribed may no longer qualify), so a change stops using them until the
+  /// next successful fetch. Their counters are kept.
   ({bool changed, List<String> rejected}) mergeAttributes(Map<String, Object?> changes) {
     var changed = false;
     final rejected = <String>[];
@@ -86,7 +92,11 @@ class SurveyEngine {
         changed = true;
       }
     });
-    if (changed) _store.setString(attributesKey, jsonEncode(_attributes));
+    if (changed) {
+      _store.setString(attributesKey, jsonEncode(_attributes));
+      _experiments = [];
+      _save();
+    }
     return (changed: changed, rejected: rejected);
   }
 
@@ -159,6 +169,7 @@ class SurveyEngine {
       for (final rule in rules) {
         if (rule.allows(count)) {
           _session = _Session.pending;
+          _pendingCount = (events: events, name: name);
           return EventDecision.experiment(experiment, Duration(milliseconds: rule.delay));
         }
       }
@@ -173,6 +184,7 @@ class SurveyEngine {
       for (final rule in rules) {
         if (rule.allows(count)) {
           _session = _Session.pending;
+          _pendingCount = (events: events, name: name);
           return EventDecision(survey, Duration(milliseconds: rule.delay));
         }
       }
@@ -181,12 +193,29 @@ class SurveyEngine {
   }
 
   /// The pending survey is now on screen; no other survey shows this session.
-  void presentationStarted() => _session = _Session.shown;
+  void presentationStarted() {
+    _session = _Session.shown;
+    _pendingCount = null;
+  }
 
   /// The pending survey could not be shown, so a later event may try again.
+  /// The event that triggered it doesn't count, or a rule that only matches
+  /// one occurrence would never get another chance.
   void presentationAbandoned() {
-    if (_session == _Session.pending) _session = _Session.idle;
+    if (_session != _Session.pending) return;
+    _session = _Session.idle;
+    final pending = _pendingCount;
+    _pendingCount = null;
+    if (pending == null) return;
+    pending.events[pending.name] = max(0, (pending.events[pending.name] ?? 0) - 1);
+    _save();
   }
+
+  /// Whether this person is still in [experiment], in the same arm. A change of
+  /// person or attributes takes it out of the cache, including during a rule's
+  /// delay.
+  bool isLive(Experiment experiment) =>
+      _experiments.any((other) => other.id == experiment.id && other.arm == experiment.arm);
 
   /// The experiment was exposed (shown, or for `control` would have been).
   /// It never triggers again for this person.

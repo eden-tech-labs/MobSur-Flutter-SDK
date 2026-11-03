@@ -99,6 +99,52 @@ void main() {
     expect(ExperimentEventQueue.backoff(60), const Duration(hours: 1));
   });
 
+  test('backoff stays at the cap however many attempts have failed', () {
+    // An uncapped power of two wraps around from about 62 attempts.
+    for (final attempts in [61, 62, 63, 64, 65, 66, 100, 1000]) {
+      expect(ExperimentEventQueue.backoff(attempts), const Duration(hours: 1), reason: '$attempts attempts');
+    }
+  });
+
+  test('gives up on an event the server keeps refusing, so later events get out', () async {
+    answers = [500];
+    var q = queue()
+      ..add('exp_a', event('e1'))
+      ..add('exp_a', event('e2'));
+    await q.flush();
+    expect(q.pending, hasLength(2));
+
+    // The first refusal's date survives a relaunch.
+    now = now.add(const Duration(days: 6, hours: 23));
+    q = queue();
+    answers = [500];
+    await q.flush();
+    expect(q.pending, hasLength(2));
+
+    now = now.add(const Duration(hours: 1));
+    answers = [500];
+    await q.flush();
+    expect(q.pending, isEmpty);
+    expect(sent.last.$2, event('e2'));
+  });
+
+  test('time offline does not count towards giving up', () async {
+    answers = [null];
+    final q = queue()..add('exp_a', event('e1'));
+    await q.flush();
+
+    now = now.add(const Duration(days: 30));
+    answers = [null];
+    await q.flush();
+    expect(q.pending, hasLength(1));
+
+    // The first real refusal only starts the clock.
+    now = now.add(const Duration(hours: 2));
+    answers = [500];
+    await q.flush();
+    expect(q.pending, hasLength(1));
+  });
+
   test('ignores a corrupt saved queue', () {
     store.values[ExperimentEventQueue.storeKey] = 'not json';
     expect(queue().pending, isEmpty);
