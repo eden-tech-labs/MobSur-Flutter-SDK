@@ -53,6 +53,7 @@ void main() {
   late List<Map<String, Object?>> experiments;
   late List<Map<String, Object?>> surveys;
   late int eventStatus;
+  late int fetchStatus;
 
   List<http.Request> fetches() => requests.where((r) => r.method == 'GET').toList();
   List<Map<String, dynamic>> events() => [
@@ -65,6 +66,7 @@ void main() {
     experiments = [experiment()];
     surveys = [];
     eventStatus = 202;
+    fetchStatus = 200;
     SharedPreferences.setMockInitialValues({});
     PackageInfo.setMockInitialValues(
       appName: 'PlantSnap',
@@ -78,7 +80,7 @@ void main() {
     MobSurSDK.httpClientOverride = MockClient((request) async {
       requests.add(request);
       if (request.method == 'POST') return http.Response('', eventStatus);
-      return http.Response(jsonEncode({'data': surveys, 'experiments': experiments}), 200);
+      return http.Response(jsonEncode({'data': surveys, 'experiments': experiments}), fetchStatus);
     });
   });
 
@@ -335,6 +337,138 @@ void main() {
         expect(events(), isEmpty, reason: arm);
         expect(MobSurSDK().availableExperiments(), hasLength(1), reason: arm);
       }
+    });
+
+    testWidgets('an experiment waiting on its delay does not run for someone who just signed in', (tester) async {
+      for (final arm in ['treatment', 'control']) {
+        requests.clear();
+        MobSurSDK().resetForTesting();
+        SharedPreferences.setMockInitialValues({});
+        experiments = [experiment(arm: arm, delay: 800)];
+        await start(tester);
+
+        MobSurSDK().logEvent(event);
+        await tester.pump(const Duration(milliseconds: 100));
+        experiments = []; // the new person isn't in it
+        await tester.runAsync(() async {
+          MobSurSDK().updateClientId('someone-else');
+          await MobSurSDK().pendingFetch;
+        });
+        await pumpSheet(tester);
+
+        expect(find.byType(ExperimentSheet), findsNothing, reason: arm);
+        expect(events(), isEmpty, reason: arm);
+      }
+    });
+
+    testWidgets('it runs for the new person if they are in the same arm, under their own ID', (tester) async {
+      experiments = [experiment(delay: 800)];
+      await start(tester);
+
+      MobSurSDK().logEvent(event);
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.runAsync(() async {
+        MobSurSDK().updateClientId('someone-else');
+        await MobSurSDK().pendingFetch;
+      });
+      await pumpSheet(tester);
+
+      expect(find.byType(ExperimentSheet), findsOneWidget);
+      expect(events().single['user_reference_id'], 'someone-else');
+    });
+
+    testWidgets('a different arm for the new person is not run with the old one', (tester) async {
+      experiments = [experiment(delay: 800)];
+      await start(tester);
+
+      MobSurSDK().logEvent(event);
+      await tester.pump(const Duration(milliseconds: 100));
+      experiments = [experiment(arm: 'control', delay: 800)];
+      await tester.runAsync(() async {
+        MobSurSDK().updateClientId('someone-else');
+        await MobSurSDK().pendingFetch;
+      });
+      await pumpSheet(tester);
+
+      expect(find.byType(ExperimentSheet), findsNothing);
+      expect(events(), isEmpty);
+    });
+
+    testWidgets('events from an open sheet stay with the person who saw it', (tester) async {
+      experiments = [experiment()];
+      await start(tester);
+
+      MobSurSDK().logEvent(event);
+      await pumpSheet(tester);
+      expect(find.byType(ExperimentSheet), findsOneWidget);
+
+      await tester.runAsync(() async {
+        MobSurSDK().updateClientId('someone-else');
+        await MobSurSDK().pendingFetch;
+      });
+      await tester.tap(find.text('Not now'));
+      await pumpSheet(tester);
+      await tester.runAsync(() => MobSurSDK().pendingEvents);
+
+      final kinds = {for (final e in events()) e['kind']: e['user_reference_id']};
+      expect(kinds['exposed'], 'firebase-uid');
+      expect(kinds['dismissed'], 'firebase-uid');
+    });
+
+    testWidgets('someone who just subscribed is not shown a saved experiment', (tester) async {
+      experiments = [experiment(delay: 800)];
+      await start(tester);
+
+      // Subscribes during the delay, and the fetch for the new value fails.
+      MobSurSDK().logEvent(event);
+      await tester.pump(const Duration(milliseconds: 100));
+      fetchStatus = 500;
+      await tester.runAsync(() async {
+        MobSurSDK().setAttributes({'is_subscribed': true});
+        await MobSurSDK().pendingFetch;
+      });
+      await pumpSheet(tester);
+      expect(find.byType(ExperimentSheet), findsNothing);
+      expect(events(), isEmpty);
+
+      // Later events don't use the saved one either, until a fetch succeeds.
+      MobSurSDK().logEvent(event);
+      await pumpSheet(tester);
+      expect(find.byType(ExperimentSheet), findsNothing);
+      expect(events(), isEmpty);
+      expect(MobSurSDK().availableExperiments(), isEmpty);
+    });
+
+    testWidgets('a veto with a one-occurrence rule still lets a later event run it', (tester) async {
+      experiments = [
+        {
+          ...experiment(),
+          'rules': [
+            {
+              'type': 'counted_event',
+              'name': event,
+              'occurred': {'min': 1, 'max': 1},
+              'delay': 0
+            },
+          ],
+        },
+      ];
+      var allowed = false;
+      await tester.pumpWidget(MaterialApp(navigatorKey: navigator, home: const Scaffold()));
+      await tester.runAsync(() async {
+        await MobSurSDK().setup(appId, 'firebase-uid', navigatorKey: navigator, canShowOverlay: () => allowed);
+        await MobSurSDK().pendingFetch;
+      });
+
+      MobSurSDK().logEvent(event);
+      await pumpSheet(tester);
+      expect(find.byType(ExperimentSheet), findsNothing);
+      expect(events(), isEmpty);
+
+      allowed = true;
+      MobSurSDK().logEvent(event);
+      await pumpSheet(tester);
+      expect(find.byType(ExperimentSheet), findsOneWidget);
     });
 
     testWidgets('canShowOverlay=false drops both arms without exposure or using the slot', (tester) async {

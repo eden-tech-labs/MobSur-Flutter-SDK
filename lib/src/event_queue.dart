@@ -16,7 +16,8 @@ typedef RetryScheduler = void Function() Function(Duration delay, void Function(
 /// Each event keeps the `event_id` it was created with, so retries are
 /// idempotent on the server. Events are sent in order and retried with exponential backoff
 /// until the server answers 2xx, or a 4xx other than 408/429 (which is final:
-/// the event is dropped).
+/// the event is dropped). An event the server has kept refusing for
+/// [giveUpAfter] is dropped too, so it can't hold back the rest forever.
 class ExperimentEventQueue {
   ExperimentEventQueue(
     this._store,
@@ -50,6 +51,10 @@ class ExperimentEventQueue {
 
   static const Duration firstRetry = Duration(seconds: 5);
   static const Duration maxRetry = Duration(hours: 1);
+
+  /// How long the server may keep refusing an event before it is dropped.
+  /// Time offline doesn't count, so a late exposure still gets through.
+  static const Duration giveUpAfter = Duration(days: 7);
 
   final KeyValueStore _store;
   final ExperimentEventSender _send;
@@ -99,6 +104,15 @@ class ExperimentEventQueue {
         _save();
         continue;
       }
+      if (status != null) {
+        event.failingSince ??= now;
+        if (now.difference(event.failingSince!) >= giveUpAfter) {
+          _log('Experiment ${event.experimentId} kept refusing the ${event.body['kind']} event with $status; dropped.');
+          _events.remove(event);
+          _save();
+          continue;
+        }
+      }
       // Retry later. The server is probably unavailable, so stop for now.
       event.attempts++;
       event.retryAt = now.add(backoff(event.attempts));
@@ -128,7 +142,9 @@ class ExperimentEventQueue {
 
   /// 5 s, 10 s, 20 s, … up to an hour.
   static Duration backoff(int attempts) {
-    final seconds = firstRetry.inSeconds * pow(2, max(0, attempts - 1));
+    // Ten doublings already pass the cap, and attempts are kept across launches:
+    // an uncapped power overflows at about 62 attempts and the delay becomes zero.
+    final seconds = firstRetry.inSeconds * pow(2, min(max(0, attempts - 1), 10));
     return seconds >= maxRetry.inSeconds ? maxRetry : Duration(seconds: seconds.toInt());
   }
 
@@ -138,12 +154,15 @@ class ExperimentEventQueue {
 }
 
 class _QueuedEvent {
-  _QueuedEvent(this.experimentId, this.body, this.attempts, this.retryAt);
+  _QueuedEvent(this.experimentId, this.body, this.attempts, this.retryAt, [this.failingSince]);
 
   final String experimentId;
   final Map<String, Object?> body;
   int attempts;
   DateTime? retryAt;
+
+  /// When the server first refused this event, if it has.
+  DateTime? failingSince;
 
   static _QueuedEvent? tryParse(Object? json) {
     if (json is! Map) return null;
@@ -151,11 +170,13 @@ class _QueuedEvent {
     final body = json['body'];
     if (id is! String || body is! Map || body['event_id'] is! String) return null;
     final retryAt = json['retry_at'];
+    final failingSince = json['failing_since'];
     return _QueuedEvent(
       id,
       Map<String, Object?>.from(body),
       json['attempts'] is int ? json['attempts'] as int : 0,
       retryAt is String ? DateTime.tryParse(retryAt) : null,
+      failingSince is String ? DateTime.tryParse(failingSince) : null,
     );
   }
 
@@ -164,5 +185,6 @@ class _QueuedEvent {
         'body': body,
         'attempts': attempts,
         'retry_at': retryAt?.toUtc().toIso8601String(),
+        'failing_since': failingSince?.toUtc().toIso8601String(),
       };
 }

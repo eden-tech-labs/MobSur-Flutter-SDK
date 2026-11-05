@@ -196,9 +196,10 @@ void main() {
       expect(jsonDecode(store.values[SurveyEngine.experimentCountersKey]!), {
         'exp_a': {'negative_id_feedback': 2},
       });
-      // Surveys are not counted for the event that triggered the experiment.
+      // Surveys are not counted for the event that triggered the experiment, and
+      // the abandoned attempt gave its count back.
       expect(jsonDecode(store.values[SurveyEngine.countersKey]!), {
-        '1': {'negative_id_feedback': 1},
+        '1': {'negative_id_feedback': 0},
       });
     });
 
@@ -213,6 +214,67 @@ void main() {
         sdk.markExperimentDone('exp_a');
         expect(sdk.recordEvent('negative_id_feedback'), isNull); // shown
       }
+    });
+
+    test('an abandoned attempt does not use up its rule', () {
+      final rule = experiment('exp_a', min: 3);
+      final sdk = engine()..applyResponse(200, withExperiments([], [rule]));
+      expect(sdk.recordEvent('negative_id_feedback'), isNull);
+      expect(sdk.recordEvent('negative_id_feedback'), isNull);
+      expect(sdk.recordEvent('negative_id_feedback')?.experiment?.id, 'exp_a');
+      sdk.presentationAbandoned();
+
+      // The next event is the third again, also after a relaunch.
+      final relaunched = engine();
+      expect(relaunched.recordEvent('negative_id_feedback')?.experiment?.id, 'exp_a');
+    });
+
+    test('a rule that matches one occurrence survives being abandoned, for surveys too', () {
+      final sdk = engine()
+        ..applyResponse(200, jsonEncode({
+          'data': [survey(1, min: 1, max: 1)],
+        }));
+      expect(sdk.recordEvent('negative_id_feedback')?.survey?.id, 1);
+      sdk.presentationAbandoned();
+      expect(sdk.recordEvent('negative_id_feedback')?.survey?.id, 1);
+    });
+
+    test('a shown presentation keeps its count, and only one is given back', () {
+      final sdk = engine()..applyResponse(200, jsonEncode({'data': [survey(1, min: 1, max: 1)]}));
+      expect(sdk.recordEvent('negative_id_feedback'), isNotNull);
+      sdk.presentationStarted();
+      sdk.presentationAbandoned(); // no longer pending: nothing to give back
+      final relaunched = engine();
+      expect(relaunched.recordEvent('negative_id_feedback'), isNull);
+    });
+
+    test('an attribute change stops using them until a fetch succeeds, and keeps the counters', () {
+      final rule = experiment('exp_a', min: 2);
+      final sdk = engine()..applyResponse(200, withExperiments([], [rule]));
+      expect(sdk.recordEvent('negative_id_feedback'), isNull);
+      final cached = sdk.experiments.single;
+      expect(sdk.isLive(cached), isTrue);
+
+      sdk.mergeAttributes({'is_subscribed': true});
+      expect(sdk.experiments, isEmpty);
+      expect(sdk.isLive(cached), isFalse);
+      expect(sdk.recordEvent('negative_id_feedback'), isNull);
+      expect(engine().experiments, isEmpty, reason: 'a relaunch before the fetch must not bring them back');
+
+      // A failed fetch doesn't bring them back either.
+      sdk.applyResponse(500, 'oops');
+      expect(sdk.experiments, isEmpty);
+
+      sdk.applyResponse(200, withExperiments([], [rule]));
+      expect(sdk.isLive(cached), isTrue);
+      expect(sdk.recordEvent('negative_id_feedback')?.experiment?.id, 'exp_a', reason: 'second event, counter kept');
+    });
+
+    test('an unchanged attribute keeps them', () {
+      final sdk = engine()..mergeAttributes({'is_subscribed': false});
+      sdk.applyResponse(200, withExperiments([], [experiment('exp_a')]));
+      sdk.mergeAttributes({'is_subscribed': false});
+      expect(sdk.experiments, hasLength(1));
     });
 
     test('run once per person, even when a stale fetch returns them again', () {
