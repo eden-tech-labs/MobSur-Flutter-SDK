@@ -4,11 +4,15 @@ import 'dart:math';
 import 'models.dart';
 import 'store.dart';
 
-/// A survey to show and how long to wait before showing it.
+/// What an event shows, and how long to wait before showing it. Exactly one
+/// of [survey] and [experiment] is set.
 class EventDecision {
-  const EventDecision(this.survey, this.delay);
+  const EventDecision(Survey this.survey, this.delay) : experiment = null;
 
-  final Survey survey;
+  const EventDecision.experiment(Experiment this.experiment, this.delay) : survey = null;
+
+  final Survey? survey;
+  final Experiment? experiment;
   final Duration delay;
 }
 
@@ -22,14 +26,14 @@ class SurveyEngine {
   SurveyEngine(this._store, {DateTime Function()? clock}) : _clock = clock ?? DateTime.now {
     _surveys = _readList(surveysKey).map(Survey.tryParse).whereType<Survey>().toList();
     _completed = _readList(completedKey).whereType<int>().toSet();
-    final counters = _readJson(countersKey);
-    if (counters is Map) {
-      counters.forEach((survey, events) {
-        if (events is! Map) return;
-        _counters[survey.toString()] = {
-          for (final entry in events.entries)
-            if (entry.value is int) entry.key.toString(): entry.value as int,
-        };
+    _readCounters(countersKey, _counters);
+    _experiments = _readList(experimentsKey).map(Experiment.tryParse).whereType<Experiment>().toList();
+    _experimentsDone = _readList(experimentsDoneKey).whereType<String>().toSet();
+    _readCounters(experimentCountersKey, _experimentCounters);
+    final attributes = _readJson(attributesKey);
+    if (attributes is Map) {
+      attributes.forEach((key, value) {
+        if (key is String && isValidAttribute(value)) _attributes[key] = value as Object;
       });
     }
   }
@@ -38,6 +42,10 @@ class SurveyEngine {
   static const String countersKey = 'MobSur_counters';
   static const String completedKey = 'MobSur_completed';
   static const String userIdKey = 'MobSur_user_id';
+  static const String experimentsKey = 'MobSur_experiments';
+  static const String experimentCountersKey = 'MobSur_experiment_counters';
+  static const String experimentsDoneKey = 'MobSur_experiments_done';
+  static const String attributesKey = 'MobSur_attributes';
 
   final KeyValueStore _store;
   final DateTime Function() _clock;
@@ -45,9 +53,52 @@ class SurveyEngine {
   List<Survey> _surveys = [];
   Set<int> _completed = {};
   final Map<String, Map<String, int>> _counters = {};
+  List<Experiment> _experiments = [];
+  Set<String> _experimentsDone = {};
+  final Map<String, Map<String, int>> _experimentCounters = {};
+  final Map<String, Object> _attributes = {};
   _Session _session = _Session.idle;
+  // The count behind the pending presentation, given back if it is abandoned.
+  ({Map<String, int> events, String name})? _pendingCount;
 
   List<Survey> get surveys => List.unmodifiable(_surveys);
+
+  List<Experiment> get experiments => List.unmodifiable(_experiments);
+
+  /// The attributes sent with each fetch, sorted by key.
+  Map<String, Object> get attributes =>
+      Map.unmodifiable(Map.fromEntries(_attributes.entries.toList()..sort((a, b) => a.key.compareTo(b.key))));
+
+  /// v1 attributes are strings, finite numbers and booleans.
+  static bool isValidAttribute(Object? value) =>
+      value is String || value is bool || (value is num && value.isFinite);
+
+  /// Merges [changes] into the saved attributes; `null` removes a key. Values of
+  /// other types are ignored and their keys returned in `rejected`.
+  ///
+  /// The cached experiments were chosen for the old attributes (someone who just
+  /// subscribed may no longer qualify), so a change stops using them until the
+  /// next successful fetch. Their counters are kept.
+  ({bool changed, List<String> rejected}) mergeAttributes(Map<String, Object?> changes) {
+    var changed = false;
+    final rejected = <String>[];
+    changes.forEach((key, value) {
+      if (value == null) {
+        if (_attributes.remove(key) != null) changed = true;
+      } else if (!isValidAttribute(value)) {
+        rejected.add(key);
+      } else if (_attributes[key] != value || _attributes[key].runtimeType != value.runtimeType) {
+        _attributes[key] = value;
+        changed = true;
+      }
+    });
+    if (changed) {
+      _store.setString(attributesKey, jsonEncode(_attributes));
+      _experiments = [];
+      _save();
+    }
+    return (changed: changed, rejected: rejected);
+  }
 
   String? get userId => _store.getString(userIdKey);
 
@@ -59,6 +110,9 @@ class SurveyEngine {
     _surveys = [];
     _completed = {};
     _counters.clear();
+    _experiments = [];
+    _experimentsDone = {};
+    _experimentCounters.clear();
     _save();
     return true;
   }
@@ -67,12 +121,15 @@ class SurveyEngine {
   FetchOutcome applyResponse(int status, String body) {
     if (status == 200) {
       final surveys = parseSurveyList(body);
-      if (surveys == null) return FetchOutcome.kept;
+      final experiments = parseExperimentList(body);
+      if (surveys == null || experiments == null) return FetchOutcome.kept;
       _replace(surveys);
+      _replaceExperiments(experiments);
       return FetchOutcome.replaced;
     }
     if (status >= 400 && status < 500 && status != 408 && status != 429) {
       _replace(const []);
+      _replaceExperiments(const []);
       return FetchOutcome.cleared;
     }
     return FetchOutcome.kept;
@@ -86,11 +143,37 @@ class SurveyEngine {
     _save();
   }
 
-  /// Counts [name] for the surveys that listen for it and returns the survey to
-  /// show, if any. At most one survey is shown per app session.
+  // Experiments shown on this device stay done for this person even when the
+  // server stops returning them (it does once it has the exposure), so a
+  // stale cache or an exposure still in the send queue can't show one twice.
+  void _replaceExperiments(List<Experiment> experiments) {
+    final ids = experiments.map((experiment) => experiment.id).toSet();
+    _experimentCounters.removeWhere((id, _) => !ids.contains(id));
+    _experiments = experiments.where((experiment) => !_experimentsDone.contains(experiment.id)).toList();
+    _save();
+  }
+
+  /// Counts [name] for the experiments and surveys that listen for it and
+  /// returns what to show, if anything. Experiments are evaluated first. At
+  /// most one experiment or survey is shown per app session.
   EventDecision? recordEvent(String name) {
     if (_session != _Session.idle) return null;
     final now = _clock();
+    for (final experiment in _experiments) {
+      if (_experimentsDone.contains(experiment.id) || !experiment.isActiveAt(now)) continue;
+      final rules = experiment.rules.where((rule) => rule.isCountedEvent && rule.name == name);
+      if (rules.isEmpty) continue;
+      final events = _experimentCounters.putIfAbsent(experiment.id, () => {});
+      final count = events[name] = (events[name] ?? 0) + 1;
+      _save();
+      for (final rule in rules) {
+        if (rule.allows(count)) {
+          _session = _Session.pending;
+          _pendingCount = (events: events, name: name);
+          return EventDecision.experiment(experiment, Duration(milliseconds: rule.delay));
+        }
+      }
+    }
     for (final survey in _surveys) {
       if (_completed.contains(survey.id) || !survey.isActiveAt(now)) continue;
       final rules = survey.rules.where((rule) => rule.isCountedEvent && rule.name == name);
@@ -101,6 +184,7 @@ class SurveyEngine {
       for (final rule in rules) {
         if (rule.allows(count)) {
           _session = _Session.pending;
+          _pendingCount = (events: events, name: name);
           return EventDecision(survey, Duration(milliseconds: rule.delay));
         }
       }
@@ -109,11 +193,36 @@ class SurveyEngine {
   }
 
   /// The pending survey is now on screen; no other survey shows this session.
-  void presentationStarted() => _session = _Session.shown;
+  void presentationStarted() {
+    _session = _Session.shown;
+    _pendingCount = null;
+  }
 
   /// The pending survey could not be shown, so a later event may try again.
+  /// The event that triggered it doesn't count, or a rule that only matches
+  /// one occurrence would never get another chance.
   void presentationAbandoned() {
-    if (_session == _Session.pending) _session = _Session.idle;
+    if (_session != _Session.pending) return;
+    _session = _Session.idle;
+    final pending = _pendingCount;
+    _pendingCount = null;
+    if (pending == null) return;
+    pending.events[pending.name] = max(0, (pending.events[pending.name] ?? 0) - 1);
+    _save();
+  }
+
+  /// Whether this person is still in [experiment], in the same arm. A change of
+  /// person or attributes takes it out of the cache, including during a rule's
+  /// delay.
+  bool isLive(Experiment experiment) =>
+      _experiments.any((other) => other.id == experiment.id && other.arm == experiment.arm);
+
+  /// The experiment was exposed (shown, or for `control` would have been).
+  /// It never triggers again for this person.
+  void markExperimentDone(String experimentId) {
+    _experimentsDone.add(experimentId);
+    _experiments.removeWhere((experiment) => experiment.id == experimentId);
+    _save();
   }
 
   void markCompleted(int surveyId) {
@@ -131,6 +240,21 @@ class SurveyEngine {
     _store.setString(surveysKey, jsonEncode(_surveys.map((survey) => survey.toJson()).toList()));
     _store.setString(completedKey, jsonEncode(_completed.toList()));
     _store.setString(countersKey, jsonEncode(_counters));
+    _store.setString(experimentsKey, jsonEncode(_experiments.map((experiment) => experiment.toJson()).toList()));
+    _store.setString(experimentsDoneKey, jsonEncode(_experimentsDone.toList()));
+    _store.setString(experimentCountersKey, jsonEncode(_experimentCounters));
+  }
+
+  void _readCounters(String key, Map<String, Map<String, int>> into) {
+    final counters = _readJson(key);
+    if (counters is! Map) return;
+    counters.forEach((id, events) {
+      if (events is! Map) return;
+      into[id.toString()] = {
+        for (final entry in events.entries)
+          if (entry.value is int) entry.key.toString(): entry.value as int,
+      };
+    });
   }
 
   Object? _readJson(String key) {

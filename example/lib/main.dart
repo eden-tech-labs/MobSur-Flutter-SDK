@@ -16,7 +16,12 @@ Future<void> main() async {
     debug: true,
     navigatorKey: navigatorKey,
     baseUrl: baseUrl.isEmpty ? null : Uri.parse(baseUrl),
+    // Experiment messages' call-to-action. Route deep links in your app here.
+    onAction: (action) => ScaffoldMessenger.maybeOf(navigatorKey.currentContext!)
+        ?.showSnackBar(SnackBar(content: Text('Call-to-action: $action'))),
   );
+  // Audience attributes for experiments, e.g. from your subscription state.
+  MobSurSDK().setAttributes({'is_subscribed': false});
   runApp(const ExampleApp());
 }
 
@@ -43,6 +48,7 @@ class EventPage extends StatefulWidget {
 
 class _EventPageState extends State<EventPage> {
   final _event = TextEditingController(text: 'negative_id_feedback');
+  bool _subscribed = false;
 
   @override
   void dispose() {
@@ -53,6 +59,7 @@ class _EventPageState extends State<EventPage> {
   @override
   Widget build(BuildContext context) {
     final surveys = MobSurSDK().availableSurveys() ?? const [];
+    final experiments = MobSurSDK().availableExperiments() ?? const [];
     return Scaffold(
       appBar: AppBar(title: const Text('MobSur example')),
       body: ListView(
@@ -67,7 +74,19 @@ class _EventPageState extends State<EventPage> {
             onPressed: () => MobSurSDK().logEvent(_event.text.trim(), context),
             child: const Text('Send event'),
           ),
+          SwitchListTile(
+            title: const Text('is_subscribed'),
+            value: _subscribed,
+            onChanged: (value) {
+              setState(() => _subscribed = value);
+              MobSurSDK().setAttributes({'is_subscribed': value});
+            },
+          ),
           const SizedBox(height: 24),
+          Text('Experiments for this device: ${experiments.length}', style: Theme.of(context).textTheme.titleMedium),
+          for (final experiment in experiments)
+            Text('${experiment.id} (${experiment.arm}) on ${experiment.rules.map((rule) => rule.name).join(', ')}'),
+          const SizedBox(height: 16),
           Text('Surveys for this device: ${surveys.length}', style: Theme.of(context).textTheme.titleMedium),
           for (final survey in surveys)
             Text('#${survey.id} on ${survey.rules.map((rule) => rule.name).join(', ')}'),
