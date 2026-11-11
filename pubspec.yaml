@@ -1,6 +1,6 @@
 name: mobsur_flutter_sdk
 description: Show MobSur in-app surveys and in-app message experiments in your Flutter app when your users reach the moments you choose.
-version: 2.1.0
+version: 2.1.1
 homepage: https://mobsur.com
 repository: https://github.com/eden-tech-labs/MobSur-Flutter-SDK
 

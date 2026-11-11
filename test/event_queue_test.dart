@@ -8,13 +8,16 @@ void main() {
   late MemoryStore store;
   late DateTime now;
   late List<(String, Map<String, Object?>)> sent;
+  late List<String> servers;
   late List<int?> answers;
   late List<Duration> scheduled;
+  const base = 'https://api.mobsur.com/';
 
   ExperimentEventQueue queue() => ExperimentEventQueue(
         store,
-        (id, body) async {
+        (id, body, baseUrl) async {
           sent.add((id, body));
+          servers.add(baseUrl);
           return answers.isEmpty ? 202 : answers.removeAt(0);
         },
         clock: () => now,
@@ -30,12 +33,13 @@ void main() {
     store = MemoryStore();
     now = DateTime.utc(2026, 10, 31, 9);
     sent = [];
+    servers = [];
     answers = [];
     scheduled = [];
   });
 
   test('sends and forgets an accepted event', () async {
-    final q = queue()..add('exp_a', event('e1'));
+    final q = queue()..add('exp_a', event('e1'), base);
     await q.flush();
 
     expect(sent.single.$1, 'exp_a');
@@ -46,7 +50,7 @@ void main() {
 
   test('retries temporary failures with backoff, with the same event_id', () async {
     answers = [null, 503, 429, 408, 202];
-    final q = queue()..add('exp_a', event('e1'));
+    final q = queue()..add('exp_a', event('e1'), base);
     await q.flush();
     expect(q.pending, hasLength(1));
     expect(scheduled.last, const Duration(seconds: 5));
@@ -67,9 +71,9 @@ void main() {
   test('drops events the server rejects for good', () async {
     answers = [404, 422, 400];
     final q = queue()
-      ..add('gone', event('e1'))
-      ..add('mismatch', event('e2'))
-      ..add('bad', event('e3'));
+      ..add('gone', event('e1'), base)
+      ..add('mismatch', event('e2'), base)
+      ..add('bad', event('e3'), base);
     await q.flush();
 
     expect(sent.map((s) => s.$1), ['gone', 'mismatch', 'bad']);
@@ -78,9 +82,9 @@ void main() {
 
   test('survives a relaunch and keeps the order', () async {
     answers = [null];
-    final first = queue()..add('exp_a', event('e1'));
+    final first = queue()..add('exp_a', event('e1'), base);
     await first.flush();
-    first.add('exp_a', event('e2', 'dismissed'));
+    first.add('exp_a', event('e2', 'dismissed'), base);
     await first.flush();
     expect(first.pending.map((e) => e['event_id']), ['e1', 'e2']);
 
@@ -109,8 +113,8 @@ void main() {
   test('gives up on an event the server keeps refusing, so later events get out', () async {
     answers = [500];
     var q = queue()
-      ..add('exp_a', event('e1'))
-      ..add('exp_a', event('e2'));
+      ..add('exp_a', event('e1'), base)
+      ..add('exp_a', event('e2'), base);
     await q.flush();
     expect(q.pending, hasLength(2));
 
@@ -130,7 +134,7 @@ void main() {
 
   test('time offline does not count towards giving up', () async {
     answers = [null];
-    final q = queue()..add('exp_a', event('e1'));
+    final q = queue()..add('exp_a', event('e1'), base);
     await q.flush();
 
     now = now.add(const Duration(days: 30));
@@ -149,9 +153,50 @@ void main() {
     store.values[ExperimentEventQueue.storeKey] = 'not json';
     expect(queue().pending, isEmpty);
     store.values[ExperimentEventQueue.storeKey] = jsonEncode([
-      {'experiment_id': 'a', 'body': {'kind': 'exposed'}}, // no event_id
-      {'experiment_id': 'b', 'body': event('ok')},
+      {'experiment_id': 'a', 'base_url': base, 'body': {'kind': 'exposed'}}, // no event_id
+      {'experiment_id': 'b', 'base_url': base, 'body': event('ok')},
     ]);
     expect(queue().pending.single['event_id'], 'ok');
+  });
+
+  test("drops 2.1.0's saved events, which don't say which server they were for", () {
+    store.values[ExperimentEventQueue.storeKey] = jsonEncode([
+      {'experiment_id': 'a', 'body': event('old'), 'attempts': 1, 'failing_since': '2026-11-01T00:00:00.000Z'},
+    ]);
+    expect(queue().pending, isEmpty);
+  });
+
+  // Review finding 4.
+  test('sends each event to the server it was created for', () async {
+    answers = [null];
+    final first = queue()..add('exp_a', event('e1'), base);
+    await first.flush();
+
+    final relaunched = queue() // e.g. a test build pointed at a local server
+      ..add('exp_a', event('e2'), 'http://192.168.1.20:8000/');
+    await relaunched.flush();
+    expect(servers, [base, base, 'http://192.168.1.20:8000/']);
+    expect(sent.map((s) => s.$2['event_id']), ['e1', 'e1', 'e2']);
+  });
+
+  // Review finding 5.
+  test('time offline after a refusal does not count towards giving up', () async {
+    answers = [503];
+    final q = queue()..add('exp_a', event('e1'), base);
+    await q.flush();
+
+    for (var day = 0; day < 8; day++) {
+      now = now.add(const Duration(days: 1));
+      answers = [null]; // offline
+      await q.flush();
+    }
+    now = now.add(const Duration(hours: 1));
+    answers = [503]; // back online, refused once more
+    await q.flush();
+    expect(q.pending, hasLength(1), reason: 'one refusal, not eight days of them');
+
+    now = now.add(const Duration(hours: 1));
+    await q.flush();
+    expect(q.pending, isEmpty);
   });
 }

@@ -4,9 +4,9 @@ import 'dart:math';
 
 import 'store.dart';
 
-/// Sends one experiment event. Returns the HTTP status, or `null` when the
-/// server could not be reached.
-typedef ExperimentEventSender = Future<int?> Function(String experimentId, Map<String, Object?> body);
+/// Sends one experiment event to [baseUrl]. Returns the HTTP status, or `null`
+/// when the server could not be reached.
+typedef ExperimentEventSender = Future<int?> Function(String experimentId, Map<String, Object?> body, String baseUrl);
 
 /// Runs [callback] after [delay]; returns something that cancels it.
 typedef RetryScheduler = void Function() Function(Duration delay, void Function() callback);
@@ -14,10 +14,13 @@ typedef RetryScheduler = void Function() Function(Duration delay, void Function(
 /// A persisted queue of `POST /api/experiments/{id}/events` calls.
 ///
 /// Each event keeps the `event_id` it was created with, so retries are
-/// idempotent on the server. Events are sent in order and retried with exponential backoff
-/// until the server answers 2xx, or a 4xx other than 408/429 (which is final:
-/// the event is dropped). An event the server has kept refusing for
-/// [giveUpAfter] is dropped too, so it can't hold back the rest forever.
+/// idempotent on the server, and the server it was created for, so a later
+/// `setup` with another base URL never receives it. Events are sent in order and
+/// retried with exponential backoff until the server answers 2xx, or a 4xx other
+/// than 408/429 (which is final: the event is dropped). An event the server has
+/// kept refusing for [giveUpAfter] is dropped too, so it can't hold back the
+/// rest forever. Only time between two refusals counts: an attempt that finds
+/// the device offline ends the streak.
 class ExperimentEventQueue {
   ExperimentEventQueue(
     this._store,
@@ -34,6 +37,8 @@ class ExperimentEventQueue {
       final list = jsonDecode(saved);
       if (list is! List) return;
       for (final item in list) {
+        // Events saved by 2.1.0 have no base URL; they are dropped rather than
+        // sent to whatever server the app is set up with now.
         final event = _QueuedEvent.tryParse(item);
         // A new app launch is a good moment to retry, whatever the old backoff.
         if (event != null) _events.add(event..retryAt = null);
@@ -52,8 +57,8 @@ class ExperimentEventQueue {
   static const Duration firstRetry = Duration(seconds: 5);
   static const Duration maxRetry = Duration(hours: 1);
 
-  /// How long the server may keep refusing an event before it is dropped.
-  /// Time offline doesn't count, so a late exposure still gets through.
+  /// How long the server may keep refusing an event before it is dropped,
+  /// counted only between refusals, so time offline never drops an exposure.
   static const Duration giveUpAfter = Duration(days: 7);
 
   final KeyValueStore _store;
@@ -68,9 +73,9 @@ class ExperimentEventQueue {
   /// Event bodies still waiting to be accepted, oldest first.
   List<Map<String, Object?>> get pending => [for (final event in _events) Map.unmodifiable(event.body)];
 
-  /// Adds an event and starts sending it.
-  void add(String experimentId, Map<String, Object?> body) {
-    _events.add(_QueuedEvent(experimentId, body, 0, null));
+  /// Adds an event for the server at [baseUrl] and starts sending it.
+  void add(String experimentId, Map<String, Object?> body, String baseUrl) {
+    _events.add(_QueuedEvent(experimentId, baseUrl, body, 0, null));
     while (_events.length > maxEvents) {
       _events.removeAt(0);
     }
@@ -92,7 +97,7 @@ class ExperimentEventQueue {
       if (event.retryAt != null && event.retryAt!.isAfter(now)) break;
       int? status;
       try {
-        status = await _send(event.experimentId, event.body);
+        status = await _send(event.experimentId, event.body, event.baseUrl);
       } catch (_) {
         status = null;
       }
@@ -105,13 +110,18 @@ class ExperimentEventQueue {
         continue;
       }
       if (status != null) {
-        event.failingSince ??= now;
-        if (now.difference(event.failingSince!) >= giveUpAfter) {
+        final lastRefusal = event.lastRefusalAt;
+        if (lastRefusal != null && now.isAfter(lastRefusal)) event.refusedFor += now.difference(lastRefusal);
+        event.lastRefusalAt = now;
+        if (event.refusedFor >= giveUpAfter) {
           _log('Experiment ${event.experimentId} kept refusing the ${event.body['kind']} event with $status; dropped.');
           _events.remove(event);
           _save();
           continue;
         }
+      } else {
+        // Offline: the time until the server is reached again does not count as refusing.
+        event.lastRefusalAt = null;
       }
       // Retry later. The server is probably unavailable, so stop for now.
       event.attempts++;
@@ -154,37 +164,50 @@ class ExperimentEventQueue {
 }
 
 class _QueuedEvent {
-  _QueuedEvent(this.experimentId, this.body, this.attempts, this.retryAt, [this.failingSince]);
+  _QueuedEvent(this.experimentId, this.baseUrl, this.body, this.attempts, this.retryAt,
+      {this.refusedFor = Duration.zero, this.lastRefusalAt});
 
   final String experimentId;
+
+  /// The server the event was created for (`setup`'s base URL then).
+  final String baseUrl;
   final Map<String, Object?> body;
   int attempts;
   DateTime? retryAt;
 
-  /// When the server first refused this event, if it has.
-  DateTime? failingSince;
+  /// How long the server has been refusing this event, counted only between refusals.
+  Duration refusedFor;
+
+  /// The latest refusal, if the attempts since then have not found the device offline.
+  DateTime? lastRefusalAt;
 
   static _QueuedEvent? tryParse(Object? json) {
     if (json is! Map) return null;
     final id = json['experiment_id'];
+    final baseUrl = json['base_url'];
     final body = json['body'];
-    if (id is! String || body is! Map || body['event_id'] is! String) return null;
+    if (id is! String || baseUrl is! String || body is! Map || body['event_id'] is! String) return null;
     final retryAt = json['retry_at'];
-    final failingSince = json['failing_since'];
+    final refusedFor = json['refused_for_ms'];
+    final lastRefusalAt = json['last_refusal_at'];
     return _QueuedEvent(
       id,
+      baseUrl,
       Map<String, Object?>.from(body),
       json['attempts'] is int ? json['attempts'] as int : 0,
       retryAt is String ? DateTime.tryParse(retryAt) : null,
-      failingSince is String ? DateTime.tryParse(failingSince) : null,
+      refusedFor: refusedFor is int ? Duration(milliseconds: refusedFor) : Duration.zero,
+      lastRefusalAt: lastRefusalAt is String ? DateTime.tryParse(lastRefusalAt) : null,
     );
   }
 
   Map<String, Object?> toJson() => {
         'experiment_id': experimentId,
+        'base_url': baseUrl,
         'body': body,
         'attempts': attempts,
         'retry_at': retryAt?.toUtc().toIso8601String(),
-        'failing_since': failingSince?.toUtc().toIso8601String(),
+        'refused_for_ms': refusedFor.inMilliseconds,
+        'last_refusal_at': lastRefusalAt?.toUtc().toIso8601String(),
       };
 }

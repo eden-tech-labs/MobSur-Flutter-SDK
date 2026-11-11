@@ -193,7 +193,7 @@ void main() {
       expect(exposed['arm'], 'treatment');
       expect(exposed['occurred_at'], matches(RegExp(r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')));
       expect(exposed['app_version'], '8.1.0');
-      expect(exposed['sdk'], 'flutter-2.1.0');
+      expect(exposed['sdk'], 'flutter-2.1.1');
       final post = requests.firstWhere((r) => r.method == 'POST');
       expect(post.url.toString(), 'https://api.mobsur.com/api/experiments/exp_01JB/events');
       expect(post.headers['Content-Type'], startsWith('application/json'));
@@ -361,7 +361,8 @@ void main() {
       }
     });
 
-    testWidgets('it runs for the new person if they are in the same arm, under their own ID', (tester) async {
+    testWidgets('a change of person drops the decision, even in the same arm', (tester) async {
+      // The event that matched was counted for the previous person.
       experiments = [experiment(delay: 800)];
       await start(tester);
 
@@ -373,6 +374,12 @@ void main() {
       });
       await pumpSheet(tester);
 
+      expect(find.byType(ExperimentSheet), findsNothing);
+      expect(events(), isEmpty);
+
+      // Their own event runs it, under their own ID.
+      MobSurSDK().logEvent(event);
+      await pumpSheet(tester);
       expect(find.byType(ExperimentSheet), findsOneWidget);
       expect(events().single['user_reference_id'], 'someone-else');
     });
@@ -508,6 +515,131 @@ void main() {
           await pumpSheet(tester);
         }
       }
+    });
+
+    // Review finding 1: canShowOverlay is app code and may switch the account.
+    testWidgets('a canShowOverlay that switches the account shows nothing and records nothing', (tester) async {
+      await tester.pumpWidget(MaterialApp(navigatorKey: navigator, home: const Scaffold()));
+      var switched = false;
+      await tester.runAsync(() async {
+        await MobSurSDK().setup(appId, 'firebase-uid', navigatorKey: navigator, canShowOverlay: () {
+          if (!switched) {
+            switched = true;
+            MobSurSDK().updateClientId('someone-else');
+          }
+          return true;
+        });
+        await MobSurSDK().pendingFetch;
+      });
+
+      MobSurSDK().logEvent(event);
+      await pumpSheet(tester);
+      await tester.runAsync(() => MobSurSDK().pendingFetch);
+
+      expect(find.byType(ExperimentSheet), findsNothing);
+      expect(events(), isEmpty);
+      final prefs = await SharedPreferences.getInstance();
+      expect(jsonDecode(prefs.getString('MobSur_experiments_done_by_owner')!), isEmpty,
+          reason: 'not done for either person');
+    });
+
+    testWidgets('a canShowOverlay that changes attributes drops the experiment and gives the count back',
+        (tester) async {
+      await tester.pumpWidget(MaterialApp(navigatorKey: navigator, home: const Scaffold()));
+      fetchStatus = 500; // the refetch for the new attributes fails, so nothing is cached again
+      var changed = false;
+      await tester.runAsync(() async {
+        fetchStatus = 200;
+        await MobSurSDK().setup(appId, 'firebase-uid', navigatorKey: navigator, canShowOverlay: () {
+          if (!changed) {
+            changed = true;
+            fetchStatus = 500;
+            MobSurSDK().setAttributes({'is_subscribed': true});
+          }
+          return true;
+        });
+        await MobSurSDK().pendingFetch;
+      });
+
+      MobSurSDK().logEvent(event);
+      await pumpSheet(tester);
+      await tester.runAsync(() => MobSurSDK().pendingFetch);
+
+      expect(find.byType(ExperimentSheet), findsNothing);
+      expect(events(), isEmpty);
+      final prefs = await SharedPreferences.getInstance();
+      expect(jsonDecode(prefs.getString('MobSur_experiment_counters')!), {
+        'exp_01JB': {event: 0},
+      });
+    });
+
+    testWidgets('a canShowOverlay that switches the account does not show the old survey', (tester) async {
+      experiments = [];
+      surveys = [survey()];
+      await tester.pumpWidget(MaterialApp(navigatorKey: navigator, home: const Scaffold()));
+      var switched = false;
+      await tester.runAsync(() async {
+        await MobSurSDK().setup(appId, 'firebase-uid', navigatorKey: navigator, canShowOverlay: () {
+          if (!switched) {
+            switched = true;
+            MobSurSDK().updateClientId('someone-else');
+          }
+          return true;
+        });
+        await MobSurSDK().pendingFetch;
+      });
+
+      MobSurSDK().logEvent(event);
+      await pumpSheet(tester);
+      await tester.runAsync(() => MobSurSDK().pendingFetch);
+      expect(find.byType(BottomSheet), findsNothing);
+    });
+
+    // Review finding 3.
+    testWidgets('switching accounts and back does not run an experiment twice', (tester) async {
+      eventStatus = 503; // the exposure stays queued
+      await start(tester);
+      MobSurSDK().logEvent(event);
+      await pumpSheet(tester);
+      await tester.tap(find.text('Not now'));
+      await pumpSheet(tester);
+      final exposureId = events().firstWhere((e) => e['kind'] == 'exposed')['event_id'];
+
+      await tester.runAsync(() async {
+        MobSurSDK().updateClientId('someone-else');
+        await MobSurSDK().pendingFetch;
+        // Relaunch as the first person; the server hasn't recorded the exposure yet.
+        MobSurSDK().resetForTesting();
+        await MobSurSDK().setup(appId, 'firebase-uid', navigatorKey: navigator);
+        await MobSurSDK().pendingFetch;
+      });
+      expect(MobSurSDK().availableExperiments(), isEmpty);
+      MobSurSDK().logEvent(event);
+      await pumpSheet(tester);
+
+      expect(find.byType(ExperimentSheet), findsNothing);
+      expect(events().where((e) => e['kind'] == 'exposed').map((e) => e['event_id']).toSet(), {exposureId});
+      MobSurSDK().resetForTesting(); // stops the retry timer
+    });
+
+    // Review finding 4.
+    testWidgets('queued events go to the server they were created for', (tester) async {
+      eventStatus = 503;
+      await start(tester);
+      MobSurSDK().logEvent(event);
+      await pumpSheet(tester);
+
+      eventStatus = 202;
+      await tester.runAsync(() async {
+        MobSurSDK().resetForTesting();
+        await MobSurSDK().setup(appId, 'firebase-uid', baseUrl: Uri.parse('http://192.168.1.20:8000'));
+        await MobSurSDK().pendingFetch;
+        await MobSurSDK().pendingEvents;
+      });
+      MobSurSDK().resetForTesting();
+      final posts = requests.where((r) => r.method == 'POST').map((r) => r.url.toString()).toSet();
+      expect(posts, {'https://api.mobsur.com/api/experiments/exp_01JB/events'});
+      expect(requests.where((r) => r.method == 'GET').last.url.host, '192.168.1.20');
     });
 
     testWidgets('canShowOverlay also gates surveys', (tester) async {

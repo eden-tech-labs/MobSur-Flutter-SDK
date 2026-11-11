@@ -8,7 +8,7 @@ surveys in the MobSur dashboard; your app only reports events.
 
 ```yaml
 dependencies:
-  mobsur_flutter_sdk: ^2.1.0
+  mobsur_flutter_sdk: ^2.1.1
 ```
 
 Requirements: Dart 3, Flutter 3.10 or newer, iOS and Android. Surveys are shown with
@@ -90,7 +90,8 @@ whether the message works. The server assigns each person to `treatment` or `con
   messages.
 
 Experiments are checked before surveys, use the same occurrence rules, and share the one-per-session
-limit with surveys. Each experiment runs at most once per person.
+limit with surveys. Each experiment runs at most once per person on the device, even if they switch
+accounts and come back.
 
 ### Attributes
 
@@ -139,8 +140,9 @@ so they stay comparable.
 ### Reporting
 
 The SDK reports `exposed`, `cta_tapped` and `dismissed` to MobSur. Reports are saved on the device
-and retried until the server has them, so a flaky connection doesn't lose them. A report the server
-keeps refusing for 7 days is dropped, so it can't block the ones behind it.
+and retried until the server has them, so a flaky connection doesn't lose them, and each one goes to
+the server it was made for, even if a later `setup` uses another `baseUrl`. A report the server keeps
+refusing for 7 days is dropped, so it can't block the ones behind it; time offline doesn't count.
 
 ## Debugging
 
