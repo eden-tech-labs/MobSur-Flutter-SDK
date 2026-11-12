@@ -27,8 +27,12 @@ class SurveyRequest {
 
 class SurveyClient {
   SurveyClient(Uri baseUrl, {http.Client? httpClient})
-      : _baseUrl = baseUrl.path.endsWith('/') ? baseUrl : baseUrl.replace(path: '${baseUrl.path}/'),
+      : _baseUrl = normalize(baseUrl),
         _http = httpClient ?? http.Client();
+
+  /// The base URL with a trailing slash, so API paths resolve below it.
+  static Uri normalize(Uri baseUrl) =>
+      baseUrl.path.endsWith('/') ? baseUrl : baseUrl.replace(path: '${baseUrl.path}/');
 
   static const Duration timeout = Duration(seconds: 20);
 
@@ -44,8 +48,9 @@ class SurveyClient {
         if (request.attributes.isNotEmpty) 'attributes': jsonEncode(request.attributes),
       });
 
-  Uri experimentEventsUri(String experimentId) =>
-      _baseUrl.resolve('api/experiments/${Uri.encodeComponent(experimentId)}/events');
+  /// Below [baseUrl] when given (the server the event was created for), else this client's.
+  Uri experimentEventsUri(String experimentId, [Uri? baseUrl]) =>
+      (baseUrl == null ? _baseUrl : normalize(baseUrl)).resolve('api/experiments/${Uri.encodeComponent(experimentId)}/events');
 
   /// Returns the HTTP status and body, or `null` when the server could not be
   /// reached.
@@ -63,11 +68,11 @@ class SurveyClient {
 
   /// Posts one experiment event. Returns the HTTP status, or `null` when the
   /// server could not be reached.
-  Future<int?> postEvent(String experimentId, Map<String, Object?> body, {String? acceptLanguage}) async {
+  Future<int?> postEvent(String experimentId, Map<String, Object?> body, {String? acceptLanguage, Uri? baseUrl}) async {
     try {
       final response = await _http
           .post(
-            experimentEventsUri(experimentId),
+            experimentEventsUri(experimentId, baseUrl),
             headers: {
               'Accept': 'application/json',
               'Content-Type': 'application/json',

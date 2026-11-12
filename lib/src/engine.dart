@@ -7,13 +7,16 @@ import 'store.dart';
 /// What an event shows, and how long to wait before showing it. Exactly one
 /// of [survey] and [experiment] is set.
 class EventDecision {
-  const EventDecision(Survey this.survey, this.delay) : experiment = null;
+  const EventDecision(Survey this.survey, this.delay, {this.token = 0}) : experiment = null;
 
-  const EventDecision.experiment(Experiment this.experiment, this.delay) : survey = null;
+  const EventDecision.experiment(Experiment this.experiment, this.delay, {this.token = 0}) : survey = null;
 
   final Survey? survey;
   final Experiment? experiment;
   final Duration delay;
+
+  /// Identifies this decision while it waits for its delay; see [SurveyEngine.isPending].
+  final int token;
 }
 
 enum FetchOutcome { replaced, cleared, kept }
@@ -23,12 +26,13 @@ enum _Session { idle, pending, shown }
 /// Decides which survey an event shows. It has no UI or network code, so the
 /// rules in `docs/sdk-contract.md` of the MobSur backend can be tested directly.
 class SurveyEngine {
-  SurveyEngine(this._store, {DateTime Function()? clock}) : _clock = clock ?? DateTime.now {
+  SurveyEngine(this._store, {String appId = '', DateTime Function()? clock})
+      : _appId = appId,
+        _clock = clock ?? DateTime.now {
     _surveys = _readList(surveysKey).map(Survey.tryParse).whereType<Survey>().toList();
     _completed = _readList(completedKey).whereType<int>().toSet();
     _readCounters(countersKey, _counters);
     _experiments = _readList(experimentsKey).map(Experiment.tryParse).whereType<Experiment>().toList();
-    _experimentsDone = _readList(experimentsDoneKey).whereType<String>().toSet();
     _readCounters(experimentCountersKey, _experimentCounters);
     final attributes = _readJson(attributesKey);
     if (attributes is Map) {
@@ -36,6 +40,8 @@ class SurveyEngine {
         if (key is String && isValidAttribute(value)) _attributes[key] = value as Object;
       });
     }
+    // Last: migrating 2.1.0's done list saves everything loaded above.
+    _readDone();
   }
 
   static const String surveysKey = 'MobSur_surveys';
@@ -44,22 +50,54 @@ class SurveyEngine {
   static const String userIdKey = 'MobSur_user_id';
   static const String experimentsKey = 'MobSur_experiments';
   static const String experimentCountersKey = 'MobSur_experiment_counters';
-  static const String experimentsDoneKey = 'MobSur_experiments_done';
+
+  /// 2.1.0 kept one flat list for whoever was signed in; it is moved to [doneKey] once.
+  static const String legacyExperimentsDoneKey = 'MobSur_experiments_done';
+
+  /// Experiments run on this device, per owner (app ID + user ID), most recently used owner last.
+  static const String doneKey = 'MobSur_experiments_done_by_owner';
   static const String attributesKey = 'MobSur_attributes';
 
+  /// Owners beyond this (least recently used first) and ids beyond this per
+  /// owner (oldest first) are forgotten, so the record stays small.
+  static const int maxDoneOwners = 50;
+  static const int maxDonePerOwner = 200;
+
   final KeyValueStore _store;
+  final String _appId;
   final DateTime Function() _clock;
 
   List<Survey> _surveys = [];
   Set<int> _completed = {};
   final Map<String, Map<String, int>> _counters = {};
   List<Experiment> _experiments = [];
-  Set<String> _experimentsDone = {};
+
+  /// Kept when the person changes: an exposure may still be waiting in the send
+  /// queue when they come back, and the server would return the experiment again.
+  final List<({String owner, List<String> ids})> _done = [];
   final Map<String, Map<String, int>> _experimentCounters = {};
   final Map<String, Object> _attributes = {};
   _Session _session = _Session.idle;
+  int _pendingToken = 0;
   // The count behind the pending presentation, given back if it is abandoned.
   ({Map<String, int> events, String name})? _pendingCount;
+
+  String get _owner => '$_appId\u001f${userId ?? ''}';
+
+  /// The experiments the current person has run on this device, in this app.
+  Set<String> get _experimentsDone {
+    for (final entry in _done) {
+      if (entry.owner == _owner) return entry.ids.toSet();
+    }
+    return const {};
+  }
+
+  /// Experiment IDs already run by the current person on this device.
+  Set<String> get doneExperimentIds => Set.unmodifiable(_experimentsDone);
+
+  /// Whether the decision with [token] is still the one waiting for its delay.
+  /// A change of person drops it, and a later decision replaces it.
+  bool isPending(int token) => _session == _Session.pending && _pendingToken == token;
 
   List<Survey> get surveys => List.unmodifiable(_surveys);
 
@@ -103,7 +141,9 @@ class SurveyEngine {
   String? get userId => _store.getString(userIdKey);
 
   /// Switches to [id]. Everything cached belonged to the previous person, so it
-  /// is discarded. Returns whether the ID changed.
+  /// is discarded, and a decision still waiting for its delay is dropped. The
+  /// per-person record of experiments already run is kept. Returns whether the
+  /// ID changed.
   bool setUserId(String id) {
     if (userId == id) return false;
     _store.setString(userIdKey, id);
@@ -111,8 +151,9 @@ class SurveyEngine {
     _completed = {};
     _counters.clear();
     _experiments = [];
-    _experimentsDone = {};
     _experimentCounters.clear();
+    if (_session == _Session.pending) _session = _Session.idle;
+    _pendingCount = null;
     _save();
     return true;
   }
@@ -148,8 +189,9 @@ class SurveyEngine {
   // stale cache or an exposure still in the send queue can't show one twice.
   void _replaceExperiments(List<Experiment> experiments) {
     final ids = experiments.map((experiment) => experiment.id).toSet();
+    final done = _experimentsDone;
     _experimentCounters.removeWhere((id, _) => !ids.contains(id));
-    _experiments = experiments.where((experiment) => !_experimentsDone.contains(experiment.id)).toList();
+    _experiments = experiments.where((experiment) => !done.contains(experiment.id)).toList();
     _save();
   }
 
@@ -159,8 +201,9 @@ class SurveyEngine {
   EventDecision? recordEvent(String name) {
     if (_session != _Session.idle) return null;
     final now = _clock();
+    final done = _experimentsDone;
     for (final experiment in _experiments) {
-      if (_experimentsDone.contains(experiment.id) || !experiment.isActiveAt(now)) continue;
+      if (done.contains(experiment.id) || !experiment.isActiveAt(now)) continue;
       final rules = experiment.rules.where((rule) => rule.isCountedEvent && rule.name == name);
       if (rules.isEmpty) continue;
       final events = _experimentCounters.putIfAbsent(experiment.id, () => {});
@@ -170,7 +213,7 @@ class SurveyEngine {
         if (rule.allows(count)) {
           _session = _Session.pending;
           _pendingCount = (events: events, name: name);
-          return EventDecision.experiment(experiment, Duration(milliseconds: rule.delay));
+          return EventDecision.experiment(experiment, Duration(milliseconds: rule.delay), token: ++_pendingToken);
         }
       }
     }
@@ -185,7 +228,7 @@ class SurveyEngine {
         if (rule.allows(count)) {
           _session = _Session.pending;
           _pendingCount = (events: events, name: name);
-          return EventDecision(survey, Duration(milliseconds: rule.delay));
+          return EventDecision(survey, Duration(milliseconds: rule.delay), token: ++_pendingToken);
         }
       }
     }
@@ -218,9 +261,15 @@ class SurveyEngine {
       _experiments.any((other) => other.id == experiment.id && other.arm == experiment.arm);
 
   /// The experiment was exposed (shown, or for `control` would have been).
-  /// It never triggers again for this person.
+  /// It never triggers again for this person on this device, in this app.
   void markExperimentDone(String experimentId) {
-    _experimentsDone.add(experimentId);
+    final owner = _owner;
+    final index = _done.indexWhere((entry) => entry.owner == owner);
+    final ids = index < 0 ? <String>[] : _done.removeAt(index).ids;
+    if (!ids.contains(experimentId)) ids.add(experimentId);
+    if (ids.length > maxDonePerOwner) ids.removeRange(0, ids.length - maxDonePerOwner);
+    _done.add((owner: owner, ids: ids));
+    if (_done.length > maxDoneOwners) _done.removeRange(0, _done.length - maxDoneOwners);
     _experiments.removeWhere((experiment) => experiment.id == experimentId);
     _save();
   }
@@ -241,8 +290,24 @@ class SurveyEngine {
     _store.setString(completedKey, jsonEncode(_completed.toList()));
     _store.setString(countersKey, jsonEncode(_counters));
     _store.setString(experimentsKey, jsonEncode(_experiments.map((experiment) => experiment.toJson()).toList()));
-    _store.setString(experimentsDoneKey, jsonEncode(_experimentsDone.toList()));
+    _store.setString(doneKey, jsonEncode([for (final entry in _done) {'owner': entry.owner, 'ids': entry.ids}]));
     _store.setString(experimentCountersKey, jsonEncode(_experimentCounters));
+  }
+
+  void _readDone() {
+    for (final item in _readList(doneKey)) {
+      if (item is! Map || item['owner'] is! String || item['ids'] is! List) continue;
+      _done.add((owner: item['owner'] as String, ids: (item['ids'] as List).whereType<String>().toList()));
+    }
+    // 2.1.0's flat list belonged to whoever was signed in then.
+    final legacy = _readList(legacyExperimentsDoneKey).whereType<String>().toList();
+    if (_store.getString(legacyExperimentsDoneKey) == null) return;
+    _store.remove(legacyExperimentsDoneKey);
+    if (legacy.isNotEmpty && userId != null) {
+      for (final id in legacy) {
+        markExperimentDone(id);
+      }
+    }
   }
 
   void _readCounters(String key, Map<String, Map<String, int>> into) {

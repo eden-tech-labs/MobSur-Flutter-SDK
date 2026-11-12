@@ -32,7 +32,7 @@ class MobSurSDK {
   static final MobSurSDK _instance = MobSurSDK._();
 
   /// This SDK's version, sent to the server as `sdk=flutter-<version>`.
-  static const String version = '2.1.0';
+  static const String version = '2.1.1';
 
   static final Uri defaultBaseUrl = Uri.parse('https://api.mobsur.com/');
 
@@ -47,6 +47,7 @@ class MobSurSDK {
   static Future<bool> Function(Uri url)? launchUrlOverride;
 
   String? _appId;
+  Uri _baseUrl = defaultBaseUrl;
   String _platform = 'ios';
   String _appVersion = '0.0';
   bool _debug = false;
@@ -106,9 +107,10 @@ class MobSurSDK {
       _appVersion = await _readAppVersion();
       _platform = platform;
       _appId = appID.trim();
-      final client = _client = SurveyClient(baseUrl ?? defaultBaseUrl, httpClient: httpClientOverride);
+      _baseUrl = SurveyClient.normalize(baseUrl ?? defaultBaseUrl);
+      final client = _client = SurveyClient(_baseUrl, httpClient: httpClientOverride);
       final store = SharedPreferencesStore(prefs);
-      final engine = _engine = SurveyEngine(store);
+      final engine = _engine = SurveyEngine(store, appId: _appId!);
       final requested = _clean(clientID) ?? _pendingUserId;
       _pendingUserId = null;
       engine.setUserId(requested ?? engine.userId ?? generateUserId());
@@ -117,7 +119,9 @@ class MobSurSDK {
       _queue?.dispose();
       final queue = _queue = ExperimentEventQueue(
         store,
-        (id, body) => client.postEvent(id, body, acceptLanguage: _acceptLanguage()),
+        // Each event goes to the server it was created for, not this setup's.
+        (id, body, baseUrl) =>
+            client.postEvent(id, body, acceptLanguage: _acceptLanguage(), baseUrl: Uri.parse(baseUrl)),
         log: _log,
       );
       _log('Ready for user ${engine.userId}.');
@@ -192,16 +196,17 @@ class MobSurSDK {
       if (decision == null) return _log('Nothing to show for "$name".');
       final experiment = decision.experiment;
       final survey = decision.survey;
+      final pending = (token: decision.token, userId: engine.userId);
       if (experiment != null) {
         _log('Experiment ${experiment.id} (${experiment.arm}) triggered by "$name"; '
             'running in ${decision.delay.inMilliseconds} ms.');
         Future.delayed(decision.delay, () {
-          _presentExperiment(engine, experiment, context != null && context.mounted ? context : null);
+          _presentExperiment(engine, experiment, pending, context != null && context.mounted ? context : null);
         });
       } else if (survey != null) {
         _log('Showing survey ${survey.id} for "$name" in ${decision.delay.inMilliseconds} ms.');
         Future.delayed(decision.delay, () {
-          _present(engine, survey, context != null && context.mounted ? context : null);
+          _present(engine, survey, pending, context != null && context.mounted ? context : null);
         });
       }
     } catch (error) {
@@ -215,8 +220,17 @@ class MobSurSDK {
   /// The experiments this person is in that haven't run yet on this device.
   List<Experiment>? availableExperiments() => _engine?.experiments;
 
-  void _presentExperiment(SurveyEngine engine, Experiment experiment, BuildContext? context) {
+  /// Whether [pending] still stands: nothing dropped or replaced it, and the
+  /// person is the same. Checked again after `canShowOverlay`, because that is
+  /// app code: it may switch the account, change attributes or log another
+  /// event before returning `true`.
+  static bool _stillPending(SurveyEngine engine, _Pending pending) =>
+      engine.isPending(pending.token) && engine.userId == pending.userId;
+
+  void _presentExperiment(SurveyEngine engine, Experiment experiment, _Pending pending, BuildContext? context) {
     try {
+      // Dropped (the person changed) or replaced since: nothing to do.
+      if (!_stillPending(engine, pending)) return;
       if (!engine.isLive(experiment)) {
         engine.presentationAbandoned();
         return _log('Experiment ${experiment.id} not run: the person or their attributes changed during the delay.');
@@ -232,11 +246,15 @@ class MobSurSDK {
         engine.presentationAbandoned();
         return _log('Experiment ${experiment.id} not run: canShowOverlay returned false.');
       }
+      if (!_stillPending(engine, pending) || !engine.isLive(experiment)) {
+        if (engine.isPending(pending.token)) engine.presentationAbandoned();
+        return _log('Experiment ${experiment.id} not run: the person or their attributes changed while canShowOverlay ran.');
+      }
       engine.presentationStarted();
       engine.markExperimentDone(experiment.id);
       // Every event from this exposure belongs to this person, even if someone
       // else signs in while the sheet is open.
-      final userId = engine.userId;
+      final userId = pending.userId;
       _report(experiment, 'exposed', userId);
       final message = experiment.message;
       if (experiment.isControl || message == null) {
@@ -287,7 +305,7 @@ class MobSurSDK {
       'platform': _platform,
       'app_version': _appVersion,
       'sdk': 'flutter-$version',
-    });
+    }, _baseUrl.toString());
   }
 
   void _runAction(String action) {
@@ -316,7 +334,8 @@ class MobSurSDK {
     return '${iso.substring(0, 19)}Z';
   }
 
-  void _present(SurveyEngine engine, Survey survey, BuildContext? context) {
+  void _present(SurveyEngine engine, Survey survey, _Pending pending, BuildContext? context) {
+    if (!_stillPending(engine, pending)) return;
     final target = context ?? _navigatorKey?.currentContext;
     if (target == null || !target.mounted) {
       engine.presentationAbandoned();
@@ -325,6 +344,10 @@ class MobSurSDK {
     if (!_hostAllowsOverlay()) {
       engine.presentationAbandoned();
       return _log('Survey ${survey.id} not shown: canShowOverlay returned false.');
+    }
+    if (!_stillPending(engine, pending) || !engine.surveys.any((cached) => cached.id == survey.id)) {
+      if (engine.isPending(pending.token)) engine.presentationAbandoned();
+      return _log('Survey ${survey.id} not shown: the person or their surveys changed while canShowOverlay ran.');
     }
     try {
       engine.presentationStarted();
@@ -416,6 +439,7 @@ class MobSurSDK {
   @visibleForTesting
   void resetForTesting() {
     _appId = null;
+    _baseUrl = defaultBaseUrl;
     _engine = null;
     _client = null;
     _pendingUserId = null;
@@ -438,3 +462,6 @@ class MobSurSDK {
   @visibleForTesting
   Future<void> get pendingFetch => _fetching ?? Future.value();
 }
+
+/// The decision a delayed survey or message belongs to.
+typedef _Pending = ({int token, String? userId});

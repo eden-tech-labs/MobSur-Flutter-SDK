@@ -1,3 +1,23 @@
+## 2.1.1
+
+Fixes for in-app message experiments, matching the iOS 1.2.0 and Android 1.5.0 SDKs.
+
+* **`canShowOverlay` switching accounts.** The callback is app code, so after it returns `true` the
+  SDK checks again that the decision still stands before showing or recording anything: same person,
+  same pending decision, experiment (or survey) still cached. Before, a callback that called
+  `updateClientId` could show the previous person's message and record it for the new one.
+* **A change of person drops a survey or message waiting for its delay.** The event that matched was
+  counted for the previous person. In 2.1.0 the new person could still be shown it if they were in the
+  same arm.
+* **Experiments already run are remembered per app ID and user ID**, and kept when the person changes,
+  so switching accounts and back no longer runs an experiment twice while its exposure is still
+  queued. The record is bounded (50 people, 200 experiments each), and 2.1.0's list is moved to
+  whoever is signed in.
+* **Each queued event keeps the server it was made for**, so a later `setup` with another `baseUrl`
+  never receives it. Events queued by 2.1.0 don't record their server and are dropped on upgrade.
+* **Only time between two refusals counts towards the 7-day give-up.** An attempt that finds the
+  device offline ends the streak, so a 503, a week offline and another 503 no longer drops the event.
+
 ## 2.1.0
 
 * **In-app message experiments with a holdout.** The fetch response's new `experiments` list is

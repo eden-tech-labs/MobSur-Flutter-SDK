@@ -303,7 +303,7 @@ void main() {
       expect(sdk.experiments, isEmpty);
     });
 
-    test('a new person starts with no experiments, counters or done ids', () {
+    test('a new person starts with no experiments or counters; done ids are kept per person', () {
       final sdk = engine()..applyResponse(200, withExperiments([], [experiment('exp_a', min: 3)]));
       sdk.recordEvent('negative_id_feedback');
       sdk.markExperimentDone('exp_a');
@@ -311,7 +311,65 @@ void main() {
       sdk.setUserId('person-2');
       expect(sdk.experiments, isEmpty);
       expect(jsonDecode(store.values[SurveyEngine.experimentCountersKey]!), isEmpty);
-      expect(jsonDecode(store.values[SurveyEngine.experimentsDoneKey]!), isEmpty);
+      expect(sdk.doneExperimentIds, isEmpty);
+
+      // Review finding 3: back to the first person, with a server that still returns it.
+      sdk.setUserId('person-1');
+      expect(sdk.doneExperimentIds, {'exp_a'});
+      sdk.applyResponse(200, withExperiments([], [experiment('exp_a')]));
+      expect(sdk.experiments, isEmpty);
+      expect(engine().doneExperimentIds, {'exp_a'}, reason: 'kept across launches');
+    });
+
+    test('a new person drops a decision waiting for its delay', () {
+      final sdk = engine()..applyResponse(200, withExperiments([], [experiment('exp_a')]));
+      final decision = sdk.recordEvent('negative_id_feedback')!;
+      expect(sdk.isPending(decision.token), isTrue);
+
+      sdk.setUserId('person-2');
+      expect(sdk.isPending(decision.token), isFalse);
+      sdk.applyResponse(200, withExperiments([], [experiment('exp_a')]));
+      final next = sdk.recordEvent('negative_id_feedback')!;
+      expect(next.token, isNot(decision.token));
+      expect(sdk.isPending(decision.token), isFalse, reason: 'an old timer cannot act on the new decision');
+    });
+
+    test('done ids are scoped to the app and bounded', () {
+      final appA = SurveyEngine(store, appId: 'app-a', clock: () => now)..setUserId('person-1');
+      appA.markExperimentDone('exp_a');
+      expect(SurveyEngine(store, appId: 'app-b', clock: () => now).doneExperimentIds, isEmpty);
+      expect(SurveyEngine(store, appId: 'app-a', clock: () => now).doneExperimentIds, {'exp_a'});
+
+      for (var n = 0; n < SurveyEngine.maxDonePerOwner + 5; n++) {
+        appA.markExperimentDone('x$n');
+      }
+      expect(appA.doneExperimentIds, hasLength(SurveyEngine.maxDonePerOwner));
+      expect(appA.doneExperimentIds, isNot(contains('exp_a')), reason: 'oldest first');
+
+      for (var n = 0; n < SurveyEngine.maxDoneOwners; n++) {
+        appA
+          ..setUserId('other-$n')
+          ..markExperimentDone('o');
+      }
+      appA.setUserId('person-1');
+      expect(appA.doneExperimentIds, isEmpty, reason: 'the least recently used person is forgotten');
+    });
+
+    test("2.1.0's done list moves to whoever is signed in, once", () {
+      store.values['MobSur_user_id'] = 'person-1';
+      store.values[SurveyEngine.experimentCountersKey] = jsonEncode({
+        'exp_b': {'negative_id_feedback': 2},
+      });
+      store.values[SurveyEngine.legacyExperimentsDoneKey] = jsonEncode(['exp_a']);
+
+      final sdk = SurveyEngine(store, clock: () => now);
+      expect(sdk.doneExperimentIds, {'exp_a'});
+      expect(store.values.containsKey(SurveyEngine.legacyExperimentsDoneKey), isFalse);
+      expect(jsonDecode(store.values[SurveyEngine.experimentCountersKey]!), {
+        'exp_b': {'negative_id_feedback': 2},
+      }, reason: 'the migration saves without losing what was loaded');
+      sdk.setUserId('person-2');
+      expect(sdk.doneExperimentIds, isEmpty);
     });
   });
 
