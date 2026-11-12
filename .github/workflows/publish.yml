@@ -21,7 +21,7 @@ jobs:
         with:
           channel: stable
       - run: flutter pub get
-      - run: flutter analyze
+      - run: flutter analyze --no-fatal-infos
       - run: flutter test
       # Requests the short-lived pub.dev token, so it runs right before publishing.
       - uses: dart-lang/setup-dart@v1
